@@ -68,6 +68,8 @@ def build_parser():
     notify_mark_prompt = notify_subparsers.add_parser("mark-prompt")
     notify_mark_prompt.add_argument("--cwd")
     notify_mark_prompt.add_argument("--json", action="store_true")
+    notify_progress = notify_subparsers.add_parser("tool-progress")
+    notify_progress.add_argument("--hook-json", action="store_true")
     notify_stage_summary = notify_subparsers.add_parser("stage-summary")
     notify_stage_summary.add_argument("--cwd")
     notify_stage_summary.add_argument("--session-id")
@@ -314,6 +316,7 @@ def _handle_notify(args, paths, *, stdin=None):
 
     if args.notify_command == "mark-prompt":
         hook_stdin = _read_hook_stdin(stdin)
+        is_hook = _hook_event_is(hook_stdin, "UserPromptSubmit")
         cwd = notify.resolve_notify_cwd(args.cwd, hook_stdin, os.getcwd())
         now = SystemClock().now()
         notify.capture_hook_payload(
@@ -333,23 +336,51 @@ def _handle_notify(args, paths, *, stdin=None):
         )
         skip_reason = notify.skip_cwd_reason(paths, cwd)
         if skip_reason:
-            emit_json({"ok": True, "command": "notify mark-prompt", "status": "skipped", "reason": skip_reason, "cwd": cwd})
+            _emit_json_for_cli_only(
+                {"ok": True, "command": "notify mark-prompt", "status": "skipped", "reason": skip_reason, "cwd": cwd},
+                is_hook=is_hook,
+            )
             return 0
         try:
             marker_key = notify.mark_prompt(paths, cwd=cwd, now=now, hook_stdin=hook_stdin)
         except RuntimeStateError as exc:
-            return _emit_runtime_state_error("notify mark-prompt", exc)
+            return _emit_runtime_state_error("notify mark-prompt", exc, quiet=is_hook)
+        progress_result = notify.start_live_completion_card(
+            paths,
+            _NotificationClient(paths, hook_stdin=hook_stdin),
+            cwd=cwd,
+            hook_stdin=hook_stdin,
+            now=now,
+        )
         route = notify.resolve_completion_route(cwd=cwd, hook_stdin=hook_stdin)
-        emit_json(
+        _emit_json_for_cli_only(
             {
                 "ok": True,
                 "command": "notify mark-prompt",
-                "status": "marked",
+                "status": "started" if progress_result.status == "started" else "marked",
+                "card_status": progress_result.status,
                 "marker_key": marker_key,
                 "route_kind": route.route_kind,
                 "route_key_hash": route.route_key_hash,
-            }
+            },
+            is_hook=is_hook,
         )
+        return 0
+
+    if args.notify_command == "tool-progress":
+        hook_stdin = _read_hook_stdin(stdin)
+        cwd = notify.resolve_notify_cwd(None, hook_stdin, os.getcwd())
+        now = SystemClock().now()
+        try:
+            notify.update_live_completion_progress(
+                paths,
+                _NotificationClient(paths, hook_stdin=hook_stdin),
+                cwd=cwd,
+                hook_stdin=hook_stdin,
+                now=now,
+            )
+        except Exception:
+            pass
         return 0
 
     if args.notify_command == "stage-summary":
@@ -392,6 +423,7 @@ def _handle_notify(args, paths, *, stdin=None):
 
     if args.command == "notify" and args.notify_command == "stop":
         hook_stdin = _read_hook_stdin(stdin)
+        is_hook = _hook_event_is(hook_stdin, "Stop")
         cwd = notify.resolve_notify_cwd(args.cwd, hook_stdin, os.getcwd())
         now = SystemClock().now()
         notify.capture_hook_payload(
@@ -418,16 +450,25 @@ def _handle_notify(args, paths, *, stdin=None):
                 hook_stdin=hook_stdin,
             )
         except RuntimeStateError as exc:
-            return _emit_runtime_state_error("notify stop", exc)
+            return _emit_runtime_state_error("notify stop", exc, quiet=is_hook)
         except MissingFeishuBinding as exc:
-            emit_json({"ok": True, "command": "notify stop", "status": "skipped", "reason": "missing_feishu_binding", "message": str(exc), "cwd": cwd})
+            _emit_json_for_cli_only(
+                {"ok": True, "command": "notify stop", "status": "skipped", "reason": "missing_feishu_binding", "message": str(exc), "cwd": cwd},
+                is_hook=is_hook,
+            )
             return 0
         if early_exit is not None:
-            emit_json({"ok": True, "command": "notify stop", "status": early_exit.status, "detail": early_exit.detail, "cwd": cwd})
+            _emit_json_for_cli_only(
+                {"ok": True, "command": "notify stop", "status": early_exit.status, "detail": early_exit.detail, "cwd": cwd},
+                is_hook=is_hook,
+            )
             return 0
         mode = notify.effective_notification_mode(paths, now=now)
         if mode == "off":
-            emit_json({"ok": True, "command": "notify stop", "status": "skipped", "reason": "notification_mode_off", "cwd": cwd})
+            _emit_json_for_cli_only(
+                {"ok": True, "command": "notify stop", "status": "skipped", "reason": "notification_mode_off", "cwd": cwd},
+                is_hook=is_hook,
+            )
             return 0
         try:
             result = notify.send_completion_from_summary(
@@ -438,11 +479,17 @@ def _handle_notify(args, paths, *, stdin=None):
                 hook_stdin=hook_stdin,
             )
         except RuntimeStateError as exc:
-            return _emit_runtime_state_error("notify stop", exc)
+            return _emit_runtime_state_error("notify stop", exc, quiet=is_hook)
         except MissingFeishuBinding as exc:
-            emit_json({"ok": True, "command": "notify stop", "status": "skipped", "reason": "missing_feishu_binding", "message": str(exc), "cwd": cwd})
+            _emit_json_for_cli_only(
+                {"ok": True, "command": "notify stop", "status": "skipped", "reason": "missing_feishu_binding", "message": str(exc), "cwd": cwd},
+                is_hook=is_hook,
+            )
             return 0
-        emit_json({"ok": True, "command": "notify stop", "status": result.status, "detail": result.detail, "cwd": cwd})
+        _emit_json_for_cli_only(
+            {"ok": True, "command": "notify stop", "status": result.status, "detail": result.detail, "cwd": cwd},
+            is_hook=is_hook,
+        )
         return 0
 
     if args.notify_command == "test":
@@ -450,6 +497,9 @@ def _handle_notify(args, paths, *, stdin=None):
             result = notify.send_test_notification(paths, _NotificationClient(paths))
         except MissingFeishuBinding as exc:
             emit_json({"ok": False, "command": "notify test", "error_code": "missing_feishu_binding", "message": str(exc)})
+            return 1
+        except LarkCliError as exc:
+            emit_json({"ok": False, "command": "notify test", "error_code": "feishu_transport_error", "message": str(exc)})
             return 1
         emit_json({"ok": True, "command": "notify test", "chat_id": result.chat_id, "message_id": result.message_id})
         return 0
@@ -569,17 +619,36 @@ def _handle_away_wait(args, paths):
     return 0
 
 
-def _emit_runtime_state_error(command: str, exc: RuntimeStateError) -> int:
-    emit_json(
-        {
-            "ok": False,
-            "command": command,
-            "status": "error",
-            "error_code": exc.error_code,
-            "detail": exc.detail,
-        }
-    )
+def _emit_runtime_state_error(command: str, exc: RuntimeStateError, *, quiet: bool = False) -> int:
+    payload = {
+        "ok": False,
+        "command": command,
+        "status": "error",
+        "error_code": exc.error_code,
+        "detail": exc.detail,
+    }
+    if quiet:
+        print(f"{command}: {exc.detail}", file=sys.stderr)
+    else:
+        emit_json(payload)
     return 1
+
+
+def _emit_json_for_cli_only(payload: dict, *, is_hook: bool) -> None:
+    if not is_hook:
+        emit_json(payload)
+
+
+def _hook_event_is(hook_stdin: str | bytes | None, expected: str) -> bool:
+    if isinstance(hook_stdin, bytes):
+        hook_stdin = hook_stdin.decode("utf-8", errors="replace")
+    if not isinstance(hook_stdin, str):
+        return False
+    try:
+        payload = json.loads(hook_stdin)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and payload.get("hook_event_name") == expected
 
 
 def _lark_cli_unavailable(binary: str | None) -> bool:
@@ -710,6 +779,51 @@ class _NotificationClient:
             )
         )
 
+    def send_live_completion_card(
+        self,
+        *,
+        status,
+        activities,
+        activity_count=None,
+        started_at,
+        now,
+        cwd,
+        answer,
+    ):
+        card = cards.live_completion_card(
+            status=status,
+            activities=activities,
+            activity_count=activity_count,
+            started_at=started_at,
+            now=now,
+            cwd=cwd,
+            answer=answer,
+        )
+        return self._send_card(card)
+
+    def update_live_completion_card(
+        self,
+        *,
+        message_id,
+        status,
+        activities,
+        activity_count=None,
+        started_at,
+        now,
+        cwd,
+        answer,
+    ):
+        card = cards.live_completion_card(
+            status=status,
+            activities=activities,
+            activity_count=activity_count,
+            started_at=started_at,
+            now=now,
+            cwd=cwd,
+            answer=answer,
+        )
+        return self.lark.update_interactive_card(message_id=message_id, card=card)
+
     def send_fallback_card(self, cwd: str):
         return self._send_card(
             cards.fallback_completion_card(
@@ -721,14 +835,29 @@ class _NotificationClient:
         )
 
     def send_test_notification(self):
-        return self._send_card(
-            cards.completion_card(
-                title="Codex Away Mode 测试通知",
-                fields={"完成": "测试通知已发送。"},
-                footer_mode_text=self._notification_footer_text(),
-                now=SystemClock().now(),
-            )
+        now = SystemClock().now()
+        started_at = now.isoformat()
+        activities = ["发送测试卡片，检查原位更新。"]
+        result = self.send_live_completion_card(
+            status="working",
+            activities=activities,
+            activity_count=1,
+            started_at=started_at,
+            now=started_at,
+            cwd=None,
+            answer=None,
         )
+        self.update_live_completion_card(
+            message_id=result.message_id,
+            status="completed",
+            activities=activities,
+            activity_count=1,
+            started_at=started_at,
+            now=SystemClock().now().isoformat(),
+            cwd=None,
+            answer="测试成功：同一张卡片已发送并原位更新。",
+        )
+        return result
 
     def send_away_early_exit_card(self, payload):
         return self._send_card(

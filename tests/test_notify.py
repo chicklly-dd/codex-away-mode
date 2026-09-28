@@ -1111,3 +1111,70 @@ def test_notification_modes_and_expired_snooze_are_pure(tmp_path):
 
     with pytest.raises(ValueError):
         notify.set_notification_mode(paths, "invalid")
+
+
+def test_progress_commands_are_capped_but_visible_commentary_is_not(tmp_path):
+    command = "Get-Content file.txt; " + ("-First 1 " * 40)
+    command_entry = notify._tool_progress_entry(
+        {
+            "tool_name": "Bash",
+            "tool_use_id": "tool_1",
+            "tool_input": {"command": command},
+        },
+        cwd="/workspace/demo",
+    )
+    displayed_command = command_entry["text"].split("\n", 1)[1]
+    assert len(displayed_command) == notify.MAX_DISPLAY_COMMAND_CHARS
+    assert displayed_command.endswith("…")
+
+    transcript = tmp_path / "transcript.jsonl"
+    visible_text = "进度说明：" + ("详细文字" * 1000)
+    records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": visible_text}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "analysis",
+                "content": [{"type": "output_text", "text": "private reasoning"}],
+            },
+        },
+    ]
+    transcript.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    entries, offset = notify._transcript_commentary_delta(
+        str(transcript),
+        0,
+        cwd="/workspace/demo",
+    )
+
+    assert len(entries) == 1
+    assert entries[0]["text"] == visible_text
+    assert entries[0]["cursor_end"] <= offset
+    assert "private reasoning" not in json.dumps(entries)
+
+
+def test_nested_exec_command_is_capped():
+    command = "Get-Content file.txt " + ("-First 1 " * 80)
+    entry = notify._tool_progress_entry(
+        {
+            "tool_name": "functions.exec",
+            "tool_input": {"code": 'await tools.exec_command({cmd:' + json.dumps(command) + '})'},
+        },
+        cwd="/workspace/demo",
+    )
+    displayed = entry["text"].split("\n", 1)[1]
+    assert entry["kind"] == "command"
+    assert len(displayed) == notify.MAX_DISPLAY_COMMAND_CHARS

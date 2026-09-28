@@ -70,7 +70,7 @@ ${CODEX_AWAY_HOME:-$HOME/.codex-away-mode}/bin/codex-away-mode doctor --json
 ${CODEX_AWAY_HOME:-$HOME/.codex-away-mode}/bin/codex-away-mode doctor --e2e-notify --json
 ```
 
-`notify test` only proves a basic Feishu send. `doctor --e2e-notify --json` proves the notification-delivery path, but it runs from the CLI and does not pass through Codex Desktop's Hook trust gate. Installation is complete only after `doctor --json` sees both notification delivery and the current Codex Desktop Hook trust state for the managed Stop, UserPromptSubmit, and PermissionRequest hooks. If `doctor --json` reports `hook_trust_disabled` or `hook_trust_missing`, ask the user to open Codex Desktop 设置 -> 钩子 (English UI: Settings -> Hooks), trust the Codex Away Mode hooks, then run `doctor --json` again.
+`notify test` only proves a basic Feishu send. `doctor --e2e-notify --json` proves the notification-delivery path, but it runs from the CLI and does not pass through Codex Desktop's Hook trust gate. Installation is complete only after `doctor --json` sees both notification delivery and the current Codex Desktop Hook trust state for the managed Stop, UserPromptSubmit, PostToolUse, and PermissionRequest hooks. If `doctor --json` reports `hook_trust_disabled` or `hook_trust_missing`, ask the user to open Codex Desktop 设置 -> 钩子 (English UI: Settings -> Hooks), trust the Codex Away Mode hooks, then run `doctor --json` again.
 
 The PermissionRequest hook sends approval reminder cards when Codex is waiting for the user to approve an operation. It can also call Feishu `urgent_app` for that reminder card when `approval_notifications_urgent_app_enabled = true`. It does not approve or reject operations from Feishu. Tell users to return to Codex Desktop to handle the approval.
 

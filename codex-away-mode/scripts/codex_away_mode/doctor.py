@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -806,7 +807,7 @@ def hooks_fingerprint(paths) -> str:
     managed: dict[str, list[dict[str, Any]]] = {}
     hooks_root = payload.get("hooks", {}) if isinstance(payload, dict) else {}
     if isinstance(hooks_root, dict):
-        for event in ("UserPromptSubmit", "Stop", "PermissionRequest"):
+        for event in ("UserPromptSubmit", "PostToolUse", "Stop", "PermissionRequest"):
             entries: list[dict[str, Any]] = []
             for group in hooks_root.get(event, []):
                 if not isinstance(group, dict):
@@ -820,6 +821,7 @@ def hooks_fingerprint(paths) -> str:
                         "codex-away-mode" not in command
                         and "notify stop --json" not in command
                         and "notify mark-prompt --json" not in command
+                        and "notify tool-progress --hook-json" not in command
                         and "notify permission-request --hook-json" not in command
                         and status_message != "Codex Away Mode managed hook"
                     ):
@@ -838,7 +840,10 @@ def hooks_fingerprint(paths) -> str:
 
 
 def _wrapper_path(paths) -> Path:
-    return Path(getattr(paths, "wrapper_path", Path(paths.data_dir) / "bin" / "codex-away-mode"))
+    path = Path(getattr(paths, "wrapper_path", Path(paths.data_dir) / "bin" / "codex-away-mode"))
+    if os.name == "nt" and path.suffix.lower() != ".cmd":
+        return Path(str(path) + ".cmd")
+    return path
 
 
 class _E2ENotificationClient:
@@ -848,14 +853,31 @@ class _E2ENotificationClient:
         self.last_result = None
 
     def send_summary_card(self, markdown: str, cwd: str | None = None):
+        now = datetime.now(timezone.utc)
+        started_at = now.isoformat()
+        activities = ["开始验证飞书通知和卡片更新。"]
         self.last_result = self.lark.send_interactive_card(
             chat_id=self.chat_id,
-            card=cards.completion_card(
-                title="Codex Away Mode E2E",
-                project=cards.project_from_cwd(cwd),
-                fields={"摘要": markdown},
-                footer_cwd=cwd,
-                footer_mode_text="安装验证。",
+            card=cards.live_completion_card(
+                status="working",
+                activities=activities,
+                activity_count=1,
+                started_at=started_at,
+                now=started_at,
+                cwd=cwd,
+                answer=None,
+            ),
+        )
+        self.lark.update_interactive_card(
+            message_id=self.last_result.message_id,
+            card=cards.live_completion_card(
+                status="completed",
+                activities=activities,
+                activity_count=1,
+                started_at=started_at,
+                now=datetime.now(timezone.utc).isoformat(),
+                cwd=cwd,
+                answer=markdown,
             ),
         )
         return self.last_result

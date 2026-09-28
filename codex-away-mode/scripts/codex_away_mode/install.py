@@ -250,7 +250,13 @@ def run_install(
         else:
             skill_discovery_mode = "degraded"
             degraded_codes.append("skill_discovery_degraded")
-    _write_wrapper(wrapper_path, runtime=runtime, scripts_dir=scripts_dir)
+    _write_wrapper(
+        wrapper_path,
+        runtime=runtime,
+        scripts_dir=scripts_dir,
+        runtime_dir=paths.runtime_dir,
+        away_home=away_home,
+    )
     changed.append(str(wrapper_path))
 
     if not Path(paths.config_path).exists():
@@ -384,7 +390,10 @@ def _skill_source_dir(paths) -> Path:
 
 
 def _wrapper_path(paths) -> Path:
-    return Path(getattr(paths, "wrapper_path", Path(paths.data_dir) / "bin" / "codex-away-mode"))
+    path = Path(getattr(paths, "wrapper_path", Path(paths.data_dir) / "bin" / "codex-away-mode"))
+    if os.name == "nt" and path.suffix.lower() != ".cmd":
+        return Path(str(path) + ".cmd")
+    return path
 
 
 def _sync_runtime_scripts(source: Path, destination: Path) -> str:
@@ -498,8 +507,28 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _write_wrapper(path: Path, *, runtime: str, scripts_dir: Path) -> None:
+def _write_wrapper(
+    path: Path,
+    *,
+    runtime: str,
+    scripts_dir: Path,
+    runtime_dir: Path,
+    away_home: Path,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        content = (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            'set "PYTHONUTF8=1"\r\n'
+            f'set "CODEX_AWAY_HOME={away_home}"\r\n'
+            f'set "CODEX_AWAY_RUNTIME_DIR={runtime_dir}"\r\n'
+            f'set "PYTHONPATH={scripts_dir};%PYTHONPATH%"\r\n'
+            f'"{runtime}" -m codex_away_mode %*\r\n'
+            "exit /b %ERRORLEVEL%\r\n"
+        )
+        path.write_text(content, encoding="utf-8", newline="")
+        return
     content = (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n\n"
@@ -539,6 +568,8 @@ def _managed_lark_cli_prefix(paths) -> Path:
 
 
 def _managed_lark_cli_path(paths) -> Path:
+    if os.name == "nt":
+        return _managed_lark_cli_prefix(paths) / "node_modules" / "@larksuite" / "cli" / "scripts" / "run.js"
     return _managed_lark_cli_prefix(paths) / "node_modules" / ".bin" / "lark-cli"
 
 
@@ -556,11 +587,19 @@ def _ensure_supported_lark_cli(paths, configured_path: str | None, *, installer=
 
 
 def _lark_cli_binary_is_supported(binary: Path) -> bool:
-    if not binary.exists() or not os.access(binary, os.X_OK):
+    if not binary.exists():
+        return False
+    command = [str(binary)]
+    if binary.suffix.lower() == ".js":
+        node = shutil.which("node.exe") or shutil.which("node")
+        if not node:
+            return False
+        command = [node, str(binary)]
+    elif not os.access(binary, os.X_OK):
         return False
     try:
         completed = subprocess.run(
-            [str(binary), "--version"],
+            [*command, "--version"],
             check=False,
             capture_output=True,
             text=True,
@@ -595,7 +634,10 @@ def _install_pinned_lark_cli(*, package: str, prefix: Path) -> Path:
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
         raise InstallSyncError(f"npm install {package} failed: {detail}")
-    binary = prefix / "node_modules" / ".bin" / "lark-cli"
+    if os.name == "nt":
+        binary = prefix / "node_modules" / "@larksuite" / "cli" / "scripts" / "run.js"
+    else:
+        binary = prefix / "node_modules" / ".bin" / "lark-cli"
     if not binary.exists():
         raise InstallSyncError(f"npm install {package} did not create {binary}")
     return binary

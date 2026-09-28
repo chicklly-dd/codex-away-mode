@@ -19,6 +19,7 @@ from .state import StateStore
 DEFAULT_SUMMARY_MAX_AGE_SECONDS = 300
 DEFAULT_PROMPT_MARKER_MAX_AGE_SECONDS = 300
 DEFAULT_COMPLETION_MARKER_MAX_AGE_SECONDS = 24 * 60 * 60
+MAX_DISPLAY_COMMAND_CHARS = 240
 _SAFE_CAPTURE_VALUE_KEYS = {
     "approval_policy",
     "cwd",
@@ -95,6 +96,342 @@ def mark_prompt(
         expires_at=expires_at,
     )
     return route_key
+
+
+def start_live_completion_card(
+    paths,
+    lark,
+    *,
+    cwd: str,
+    hook_stdin: str | bytes | None,
+    now: datetime,
+) -> NotifyResult:
+    try:
+        config = load_config(Path(paths.config_path))
+        if _config_mode(config, now=now) == "off":
+            return NotifyResult("skipped", "notification_mode_off")
+        send_live = getattr(lark, "send_live_completion_card", None)
+        if send_live is None:
+            return NotifyResult("skipped", "live_card_client_unavailable")
+
+        store = _runtime_store(paths)
+        route = resolve_completion_route(cwd=cwd, hook_stdin=hook_stdin)
+        started_at = _to_utc(now).isoformat()
+        activities = [{"kind": "commentary", "text": "收到新任务，开始处理。"}]
+        transcript_offset = _transcript_file_size_from_hook(hook_stdin)
+        existing = store.get_live_completion_card(route)
+        if existing:
+            update_live = getattr(lark, "update_live_completion_card", None)
+            if update_live is None:
+                return NotifyResult("update_failed", "live_card_client_unavailable")
+            update_live(
+                message_id=existing["message_id"],
+                status="working",
+                activities=activities,
+                started_at=started_at,
+                now=started_at,
+                cwd=cwd,
+                answer=None,
+            )
+            store.create_live_completion_card(
+                route=route,
+                message_id=existing["message_id"],
+                started_at=started_at,
+                activities=activities,
+                transcript_offset=transcript_offset,
+            )
+            return NotifyResult("started")
+        result = send_live(
+            status="working",
+            activities=activities,
+            started_at=started_at,
+            now=started_at,
+            cwd=cwd,
+            answer=None,
+        )
+        message_id = getattr(result, "message_id", None)
+        if not message_id:
+            return NotifyResult("send_failed", "message_id_missing")
+        store.create_live_completion_card(
+            route=route,
+            message_id=str(message_id),
+            started_at=started_at,
+            activities=activities,
+            transcript_offset=transcript_offset,
+        )
+    except Exception:
+        return NotifyResult("send_failed")
+    return NotifyResult("started")
+
+
+def update_live_completion_progress(
+    paths,
+    lark,
+    *,
+    cwd: str,
+    hook_stdin: str | bytes | None,
+    now: datetime,
+) -> NotifyResult:
+    config = load_config(Path(paths.config_path))
+    if _config_mode(config, now=now) == "off":
+        return NotifyResult("skipped", "notification_mode_off")
+    update_live = getattr(lark, "update_live_completion_card", None)
+    if update_live is None:
+        return NotifyResult("skipped", "live_card_client_unavailable")
+    hook_payload = _hook_payload_mapping(hook_stdin)
+    tool_name = hook_payload.get("tool_name")
+    if not tool_name:
+        return NotifyResult("skipped", "tool_name_missing")
+
+    store = _runtime_store(paths)
+    route = resolve_completion_route(cwd=cwd, hook_stdin=hook_stdin)
+    live = store.get_live_completion_card(route)
+    if not live:
+        return NotifyResult("skipped", "live_card_missing")
+    transcript_path = hook_payload.get("transcript_path")
+    commentary, transcript_offset = _transcript_commentary_delta(
+        transcript_path,
+        int(live.get("transcript_offset") or 0),
+        cwd=cwd,
+    )
+    tool_activity = _tool_progress_entry(hook_payload, cwd=cwd)
+    entries = [*commentary, tool_activity]
+    row = store.append_live_completion_entries(
+        route=route,
+        entries=entries,
+        updated_at=_to_utc(now).isoformat(),
+        transcript_offset=transcript_offset,
+    )
+    if not row:
+        return NotifyResult("skipped", "live_card_missing")
+    if not row.get("appended_count"):
+        return NotifyResult("updated", str(row.get("activity_count") or 0))
+    payload = {
+        "status": "working",
+        "activities": row.get("activities") or [],
+        "activity_count": row.get("activity_count"),
+        "started_at": row["started_at"],
+        "now": _to_utc(now).isoformat(),
+        "cwd": cwd,
+        "answer": None,
+    }
+    try:
+        update_live(message_id=row["message_id"], **payload)
+    except Exception:
+        return NotifyResult("update_failed")
+    return NotifyResult("updated", str(row.get("activity_count") or 0))
+
+
+def _tool_progress_entry(payload: dict[str, Any], *, cwd: str) -> dict[str, Any]:
+    tool_name = str(payload.get("tool_name") or "").strip()
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    command = tool_input.get("command")
+    if not command and isinstance(tool_input.get("cmd"), str):
+        command = tool_input["cmd"]
+    if not command and isinstance(tool_input.get("code"), str):
+        nested = re.search(r'\bcmd\s*:\s*("(?:\\.|[^"\\])*")', tool_input["code"])
+        if nested:
+            try:
+                command = json.loads(nested.group(1))
+            except json.JSONDecodeError:
+                pass
+    if isinstance(command, str) and command.strip() and tool_name != "apply_patch":
+        display_command = _truncate_display(
+            _redact_progress_content(command, cwd=cwd),
+            MAX_DISPLAY_COMMAND_CHARS,
+        )
+        return {
+            "kind": "command",
+            "text": f"已运行命令：\n{display_command}",
+            "tool_use_id": _optional_text(payload.get("tool_use_id")),
+        }
+    if tool_name == "apply_patch" and isinstance(command, str):
+        return {
+            "kind": "tool",
+            "text": _summarize_patch(command),
+            "tool_use_id": _optional_text(payload.get("tool_use_id")),
+        }
+
+    path = tool_input.get("file_path") or tool_input.get("path")
+    basename = re.split(r"[\\/]", str(path).strip())[-1] if path else ""
+    if basename and tool_name in {"Read", "Write", "Edit"}:
+        verb = {"Read": "读取", "Write": "写入", "Edit": "编辑"}[tool_name]
+        label = f"已{verb} {basename}"
+    else:
+        label = _progress_activity_label(tool_name)
+    return {
+        "kind": "tool",
+        "text": label,
+        "tool_use_id": _optional_text(payload.get("tool_use_id")),
+    }
+
+
+def _progress_activity_label(tool_name: str) -> str:
+    name = str(tool_name).strip()
+    labels = {
+        "Bash": "已完成命令操作",
+        "apply_patch": "已完成代码修改",
+        "Read": "已读取项目内容",
+        "Write": "已写入文件",
+        "Edit": "已编辑文件",
+        "Agent": "已完成子任务",
+    }
+    if name in labels:
+        return labels[name]
+    if name.startswith("mcp__"):
+        return f"已完成外部工具操作（{name}）"
+    return f"已完成工具操作（{name or '未知工具'}）"
+
+
+def _summarize_patch(patch: str) -> str:
+    files = []
+    for line in patch.splitlines():
+        for operation in ("Update", "Add", "Delete", "Move"):
+            prefix = f"*** {operation} File:"
+            if line.startswith(prefix):
+                files.append(line[len(prefix) :].strip())
+                break
+    added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
+    if files:
+        names = [re.split(r"[\\/]", item.strip())[-1] for item in files[:8]]
+        suffix = f"（+{added} -{removed}）" if added or removed else ""
+        extra = f" 等 {len(files)} 个文件" if len(files) > len(names) else ""
+        return f"已编辑 {', '.join(names)}{extra}{suffix}"
+    return "已完成代码修改"
+
+
+def _hook_payload_mapping(hook_stdin: str | bytes | None) -> dict[str, Any]:
+    if isinstance(hook_stdin, bytes):
+        hook_text = hook_stdin.decode("utf-8", errors="replace")
+    else:
+        hook_text = hook_stdin or ""
+    try:
+        payload = json.loads(hook_text)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _transcript_file_size_from_hook(hook_stdin: str | bytes | None) -> int:
+    transcript_path = _hook_payload_mapping(hook_stdin).get("transcript_path")
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return 0
+    try:
+        return Path(transcript_path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _transcript_commentary_delta(
+    transcript_path: Any,
+    offset: int,
+    *,
+    cwd: str,
+) -> tuple[list[dict[str, Any]], int | None]:
+    """Read only visible assistant commentary; transcript structure is best-effort."""
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return [], None
+    path = Path(transcript_path)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            if offset < 0 or offset > size:
+                # Avoid replaying earlier turns if Codex compacts or replaces the transcript.
+                return [], size
+            handle.seek(offset)
+            chunk = handle.read()
+    except OSError:
+        return [], None
+
+    last_newline = chunk.rfind(bytes((10,)))
+    if last_newline < 0:
+        return [], offset
+    complete = chunk[: last_newline + 1]
+    cursor = offset
+    entries: list[dict[str, Any]] = []
+    for raw_line in complete.splitlines(keepends=True):
+        cursor += len(raw_line)
+        try:
+            record = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        # Do not read analysis/reasoning or encrypted summary records.
+        if (
+            payload.get("type") != "message"
+            or payload.get("role") != "assistant"
+            or payload.get("phase") != "commentary"
+        ):
+            continue
+        content = payload.get("content")
+        if not isinstance(content, list):
+            continue
+        text = "\n".join(
+            str(item.get("text") or "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "output_text"
+        ).strip()
+        if text:
+            entries.append(
+                {
+                    "kind": "commentary",
+                    "text": _redact_progress_content(text, cwd=cwd),
+                    "cursor_end": cursor,
+                }
+            )
+    return entries, offset + len(complete)
+
+
+def _optional_text(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def _flush_live_commentary(
+    store: StateStore,
+    route,
+    live: dict[str, Any],
+    *,
+    hook_stdin: str | bytes | None,
+    cwd: str,
+    now: datetime,
+) -> dict[str, Any]:
+    transcript_path = _hook_payload_mapping(hook_stdin).get("transcript_path")
+    commentary, transcript_offset = _transcript_commentary_delta(
+        transcript_path,
+        int(live.get("transcript_offset") or 0),
+        cwd=cwd,
+    )
+    if commentary or transcript_offset is not None:
+        store.append_live_completion_entries(
+            route=route,
+            entries=commentary,
+            updated_at=_to_utc(now).isoformat(),
+            transcript_offset=transcript_offset,
+        )
+        return store.get_live_completion_card(route) or live
+    return live
+
+
+def _redact_progress_content(value: str, *, cwd: str) -> str:
+    text = _redact_for_display(value) or ""
+    local_paths = {cwd, str(Path.home())}
+    for env_name in ("USERPROFILE", "LOCALAPPDATA", "APPDATA"):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            local_paths.add(env_value)
+    for local_path in sorted(local_paths, key=len, reverse=True):
+        if local_path:
+            text = re.sub(re.escape(local_path), "[本地路径]", text, flags=re.IGNORECASE)
+    return text
 
 
 def stage_summary(
@@ -468,6 +805,33 @@ def send_completion_from_summary(
     active_marker = marker or legacy_marker
 
     if goal_status == "active":
+        live = store.get_live_completion_card(route)
+        update_live = getattr(lark, "update_live_completion_card", None)
+        if live and update_live:
+            live = _flush_live_commentary(
+                store,
+                route,
+                live,
+                hook_stdin=hook_stdin,
+                cwd=cwd,
+                now=now,
+            )
+            activities = list(live.get("activities") or [])
+            if not activities or activities[-1] != "目标任务仍在继续。":
+                activities.append("目标任务仍在继续。")
+            try:
+                update_live(
+                    message_id=live["message_id"],
+                    status="working",
+                    activities=activities,
+                    activity_count=live.get("activity_count"),
+                    started_at=live["started_at"],
+                    now=_to_utc(now).isoformat(),
+                    cwd=cwd,
+                    answer=None,
+                )
+            except Exception:
+                pass
         store.delete_completion_summary(route)
         if active_summary:
             store.delete_staged_summary_by_hash(active_summary.get("cwd_hash"))
@@ -485,8 +849,81 @@ def send_completion_from_summary(
         return NotifyResult("skipped", "goal_active")
 
     summary = active_summary
+    live = store.get_live_completion_card(route)
+    update_live = getattr(lark, "update_live_completion_card", None)
+    if live and update_live:
+        live = _flush_live_commentary(
+            store,
+            route,
+            live,
+            hook_stdin=hook_stdin,
+            cwd=cwd,
+            now=now,
+        )
+        last_assistant_message = _extract_stdin_string_field(
+            hook_stdin,
+            "last_assistant_message",
+        )
+        fresh_summary = (
+            summary
+            if summary
+            and _runtime_record_is_fresh(summary, "staged_at", max_age_seconds, now)
+            else None
+        )
+        answer = last_assistant_message or (
+            fresh_summary.get("summary_markdown") if fresh_summary else None
+        )
+        answer = answer or "本轮已结束，但没有可用的最终答复摘要。"
+        try:
+            update_live(
+                message_id=live["message_id"],
+                status="completed",
+                activities=live.get("activities") or [],
+                activity_count=live.get("activity_count"),
+                started_at=live["started_at"],
+                now=_to_utc(now).isoformat(),
+                cwd=cwd,
+                answer=answer,
+            )
+        except Exception:
+            # Keep the existing card and its state for a later retry. Sending a
+            # second completion message here leaves a stale working card behind.
+            return NotifyResult("update_failed", "live_card_update_failed")
+        else:
+            store.delete_live_completion_card(route)
+            store.delete_completion_summary(route)
+            store.delete_completion_prompt_marker(route)
+            if summary:
+                store.delete_staged_summary_by_hash(summary.get("cwd_hash"))
+            if active_marker:
+                store.delete_prompt_marker_by_hash(active_marker.get("cwd_hash"))
+            _record_completion_decision(
+                store,
+                decision="live_card_updated",
+                reason=None,
+                route=route,
+                cwd=cwd,
+                goal_status=goal_status,
+                summary_present=summary is not None,
+                marker_present=active_marker is not None,
+                now=now,
+            )
+            return NotifyResult("live_card_updated")
+
     if summary and _runtime_record_is_fresh(summary, "staged_at", max_age_seconds, now):
-        lark.send_summary_card(summary["summary_markdown"], cwd=cwd)
+        send_live = getattr(lark, "send_live_completion_card", None)
+        if send_live:
+            timestamp = _to_utc(now).isoformat()
+            send_live(
+                status="completed",
+                activities=[],
+                started_at=timestamp,
+                now=timestamp,
+                cwd=cwd,
+                answer=summary["summary_markdown"],
+            )
+        else:
+            lark.send_summary_card(summary["summary_markdown"], cwd=cwd)
         store.delete_completion_summary(route)
         store.delete_completion_prompt_marker(route)
         store.delete_staged_summary_by_hash(summary.get("cwd_hash"))

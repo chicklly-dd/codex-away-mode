@@ -9,6 +9,7 @@ from typing import Any
 MANAGED_STATUS_MESSAGE = "Codex Away Mode managed hook"
 REQUIRED_EVENTS = {
     "UserPromptSubmit": "user_prompt_submit",
+    "PostToolUse": "post_tool_use",
     "Stop": "stop",
     "PermissionRequest": "permission_request",
 }
@@ -67,7 +68,7 @@ def evaluate_hook_trust(paths) -> dict[str, Any]:
             "next_step": (
                 "Codex Away Mode 的 Hook 当前在 Codex Desktop 里被关闭。请打开 "
                 "Codex Desktop 设置 -> 钩子（英文界面为 Settings -> Hooks），重新信任 Codex Away Mode 的 Stop、"
-                "UserPromptSubmit 和 PermissionRequest Hook，然后重新运行 codex-away-mode doctor --json。"
+                "UserPromptSubmit、PostToolUse 和 PermissionRequest Hook，然后重新运行 codex-away-mode doctor --json。"
             ),
         }
     if missing:

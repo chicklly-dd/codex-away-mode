@@ -260,6 +260,17 @@ class StateStore:
                     expires_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS live_completion_cards (
+                    route_key_hash TEXT PRIMARY KEY,
+                    message_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    activity_count INTEGER NOT NULL DEFAULT 0,
+                    activities_json TEXT NOT NULL DEFAULT '[]',
+                    transcript_offset INTEGER NOT NULL DEFAULT 0,
+                    tool_use_ids_json TEXT NOT NULL DEFAULT '[]'
+                );
+
                 CREATE TABLE IF NOT EXISTS away_resume_tokens (
                     session_id TEXT PRIMARY KEY,
                     token_hash TEXT NOT NULL,
@@ -307,6 +318,14 @@ class StateStore:
         }.items():
             if name not in approval_columns:
                 conn.execute(f"ALTER TABLE approval_notifications ADD COLUMN {name} {ddl}")
+
+        live_card_columns = self._table_columns(conn, "live_completion_cards")
+        for name, ddl in {
+            "transcript_offset": "INTEGER NOT NULL DEFAULT 0",
+            "tool_use_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        }.items():
+            if name not in live_card_columns:
+                conn.execute(f"ALTER TABLE live_completion_cards ADD COLUMN {name} {ddl}")
 
     @staticmethod
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -1823,6 +1842,144 @@ class StateStore:
         with self._connect() as conn:
             conn.execute(
                 "DELETE FROM completion_summaries WHERE route_key_hash = ?",
+                (route.route_key_hash,),
+            )
+
+    def create_live_completion_card(
+        self,
+        *,
+        route: CompletionRoute,
+        message_id: str,
+        started_at: str,
+        activities: list[Any],
+        transcript_offset: int = 0,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_completion_cards (
+                    route_key_hash, message_id, started_at, updated_at,
+                    activity_count, activities_json, transcript_offset,
+                    tool_use_ids_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]')
+                ON CONFLICT(route_key_hash) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    started_at = excluded.started_at,
+                    updated_at = excluded.updated_at,
+                    activity_count = excluded.activity_count,
+                    activities_json = excluded.activities_json,
+                    transcript_offset = excluded.transcript_offset,
+                    tool_use_ids_json = '[]'
+                """,
+                (
+                    route.route_key_hash,
+                    message_id,
+                    started_at,
+                    started_at,
+                    len(activities),
+                    json.dumps(activities, ensure_ascii=False),
+                    max(0, int(transcript_offset)),
+                ),
+            )
+
+    def get_live_completion_card(self, route: CompletionRoute) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM live_completion_cards WHERE route_key_hash = ?",
+                (route.route_key_hash,),
+            ).fetchone()
+        result = self._row_to_dict(row)
+        if result:
+            try:
+                result["activities"] = json.loads(result.pop("activities_json") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                result["activities"] = []
+        return result
+
+    def append_live_completion_entries(
+        self,
+        *,
+        route: CompletionRoute,
+        entries: list[dict[str, Any]],
+        updated_at: str,
+        transcript_offset: int | None = None,
+        max_activities: int = 200,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM live_completion_cards WHERE route_key_hash = ?",
+                (route.route_key_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                activities = json.loads(row["activities_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                activities = []
+            activities = [item for item in activities if item]
+            current_offset = int(row["transcript_offset"] or 0)
+            try:
+                processed_ids = json.loads(row["tool_use_ids_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                processed_ids = []
+            processed_ids = [str(item) for item in processed_ids if str(item)]
+            processed_id_set = set(processed_ids)
+            appended: list[dict[str, Any]] = []
+            for entry in entries:
+                kind = entry.get("kind")
+                if kind == "commentary":
+                    cursor_end = int(entry.get("cursor_end") or 0)
+                    if cursor_end <= current_offset:
+                        continue
+                elif kind in {"command", "tool"}:
+                    use_id = str(entry.get("tool_use_id") or "")
+                    if use_id and use_id in processed_id_set:
+                        continue
+                    if use_id:
+                        processed_id_set.add(use_id)
+                        processed_ids.append(use_id)
+                text = str(entry.get("text") or "").strip()
+                if text:
+                    appended.append({key: value for key, value in entry.items() if key != "cursor_end"})
+            activities.extend(appended)
+            count = int(row["activity_count"] or 0) + len(appended)
+            new_offset = current_offset
+            if transcript_offset is not None:
+                new_offset = max(current_offset, int(transcript_offset))
+            processed_ids = processed_ids[-500:]
+            conn.execute(
+                """
+                UPDATE live_completion_cards
+                SET updated_at = ?, activity_count = ?, activities_json = ?,
+                    transcript_offset = ?, tool_use_ids_json = ?
+                WHERE route_key_hash = ?
+                """,
+                (
+                    updated_at,
+                    count,
+                    json.dumps(activities[-max_activities:], ensure_ascii=False),
+                    new_offset,
+                    json.dumps(processed_ids, ensure_ascii=False),
+                    route.route_key_hash,
+                ),
+            )
+            result = dict(row)
+            result.update(
+                updated_at=updated_at,
+                activity_count=count,
+                activities=activities[-max_activities:],
+                transcript_offset=new_offset,
+                appended_count=len(appended),
+            )
+            result.pop("activities_json", None)
+            result.pop("tool_use_ids_json", None)
+            return result
+
+    def delete_live_completion_card(self, route: CompletionRoute) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM live_completion_cards WHERE route_key_hash = ?",
                 (route.route_key_hash,),
             )
 

@@ -20,6 +20,10 @@ def managed_user_prompt_command(cli_command: str) -> str:
     return f"{cli_command} notify mark-prompt --json"
 
 
+def managed_post_tool_use_command(cli_command: str) -> str:
+    return f"{cli_command} notify tool-progress --hook-json"
+
+
 def managed_permission_request_command(cli_command: str) -> str:
     return f"{cli_command} notify permission-request --hook-json"
 
@@ -29,6 +33,7 @@ def install_guidance_block(content: str, *, cli_command: str = "codex-away-mode"
         f"{GUIDANCE_START}\n"
         "## Codex Away Mode\n\n"
         f"Before a user-visible completed turn, stage the completion summary by running `{cli_command} notify stage-summary --cwd \"$PWD\" --session-id \"${{CODEX_THREAD_ID:-}}\" --json` and passing the summary markdown on stdin.\n"
+        "The Feishu completion card starts on UserPromptSubmit, refreshes after tool operations, and ends with the final user-visible answer. Its execution timeline includes user-visible assistant commentary and completed tool operations, never private reasoning. Commands are limited to 240 characters; visible commentary is not truncated per item.\n"
         "Do not write Codex Away Mode summary, marker, state, or runtime files under the current workspace cwd.\n"
         "Do not write this summary for in-progress goal-mode continuation turns; wait until the goal is complete, blocked, or needs human attention.\n"
         "Stop hook also suppresses completion notifications when the transcript goal status is active.\n"
@@ -72,6 +77,13 @@ def install_hooks(*, hooks_path, backup_dir, cli_command: str) -> dict[str, Any]
         managed_user_prompt_command(cli_command),
         timeout=10,
     )
+    _remove_managed_entries(hooks_root, "PostToolUse")
+    _ensure_managed_entry(
+        hooks_root,
+        "PostToolUse",
+        managed_post_tool_use_command(cli_command),
+        timeout=10,
+    )
     _remove_managed_entries(hooks_root, "PermissionRequest")
     _ensure_managed_entry(
         hooks_root,
@@ -90,7 +102,7 @@ def uninstall_hooks(*, hooks_path, backup_dir) -> dict[str, Any]:
         _backup(hooks_path, backup_dir)
 
     hooks_root = data.setdefault("hooks", {})
-    for event in ("Stop", "UserPromptSubmit", "PermissionRequest"):
+    for event in ("Stop", "UserPromptSubmit", "PostToolUse", "PermissionRequest"):
         _remove_managed_entries(hooks_root, event)
     _write_hooks(hooks_path, data)
     return data
@@ -130,6 +142,7 @@ def _is_managed_hook(hook: dict[str, Any]) -> bool:
         hook.get("statusMessage") == MANAGED_STATUS_MESSAGE
         or command.endswith(" notify stop --json")
         or command.endswith(" notify mark-prompt --json")
+        or command.endswith(" notify tool-progress --hook-json")
         or command.endswith(" notify permission-request --hook-json")
     )
 

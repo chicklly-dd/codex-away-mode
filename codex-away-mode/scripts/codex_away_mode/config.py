@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
@@ -154,11 +157,14 @@ def prepare_runtime_dir(runtime_dir: str | Path) -> Path:
         raise RuntimeStateError("runtime_dir_not_directory")
     if not runtime_dir.exists():
         runtime_dir.mkdir(parents=True, mode=0o700)
+        if os.name == "nt":
+            _secure_windows_runtime_dir(runtime_dir)
     _validate_runtime_dir(runtime_dir)
-    try:
-        os.chmod(runtime_dir, 0o700)
-    except OSError:
-        pass
+    if os.name != "nt":
+        try:
+            os.chmod(runtime_dir, 0o700)
+        except OSError:
+            pass
     return runtime_dir
 
 
@@ -196,12 +202,118 @@ def _validate_runtime_dir(runtime_dir: Path) -> None:
         stat_result = runtime_dir.stat()
     except OSError:
         raise RuntimeStateError("runtime_dir_not_writable")
-    if hasattr(os, "getuid") and stat_result.st_uid != os.getuid():
-        raise RuntimeStateError("runtime_dir_not_owned_by_user")
-    if stat_result.st_mode & 0o077:
-        raise RuntimeStateError("runtime_dir_permissions_too_open")
+    if os.name == "nt":
+        _validate_windows_runtime_dir(runtime_dir)
+    else:
+        if hasattr(os, "getuid") and stat_result.st_uid != os.getuid():
+            raise RuntimeStateError("runtime_dir_not_owned_by_user")
+        if stat_result.st_mode & 0o077:
+            raise RuntimeStateError("runtime_dir_permissions_too_open")
     if not os.access(runtime_dir, os.W_OK):
         raise RuntimeStateError("runtime_dir_not_writable")
+
+
+def _windows_identity() -> tuple[str, str]:
+    whoami = shutil.which("whoami.exe") or shutil.which("whoami")
+    if not whoami:
+        raise RuntimeStateError("runtime_dir_acl_unverifiable")
+    try:
+        result = subprocess.run(
+            [whoami, "/user", "/fo", "csv", "/nh"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        row = next(csv.reader(result.stdout.splitlines()), [])
+    except (OSError, subprocess.SubprocessError, StopIteration):
+        raise RuntimeStateError("runtime_dir_acl_unverifiable")
+    if len(row) < 2 or not row[0] or not row[1]:
+        raise RuntimeStateError("runtime_dir_acl_unverifiable")
+    return row[0].strip(), row[1].strip()
+
+
+def _secure_windows_runtime_dir(runtime_dir: Path) -> None:
+    icacls = shutil.which("icacls.exe") or shutil.which("icacls")
+    if not icacls:
+        raise RuntimeStateError("runtime_dir_acl_unverifiable")
+    _, user_sid = _windows_identity()
+    commands = (
+        [icacls, str(runtime_dir), "/inheritance:r"],
+        [
+            icacls,
+            str(runtime_dir),
+            "/grant:r",
+            f"*{user_sid}:(OI)(CI)(F)",
+            "*S-1-5-18:(OI)(CI)(F)",
+            "*S-1-5-32-544:(OI)(CI)(F)",
+        ],
+    )
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeStateError("runtime_dir_acl_unverifiable")
+        if result.returncode != 0:
+            raise RuntimeStateError("runtime_dir_acl_unverifiable")
+
+
+def _validate_windows_runtime_dir(runtime_dir: Path) -> None:
+    icacls = shutil.which("icacls.exe") or shutil.which("icacls")
+    if not icacls:
+        raise RuntimeStateError("runtime_dir_acl_unverifiable")
+    username, user_sid = _windows_identity()
+    try:
+        result = subprocess.run(
+            [icacls, str(runtime_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeStateError("runtime_dir_acl_unverifiable")
+
+    allowed = {
+        username.casefold(),
+        user_sid.casefold(),
+        "nt authority\\system",
+        "s-1-5-18",
+        "builtin\\administrators",
+        "s-1-5-32-544",
+        "owner rights",
+    }
+    expected_path = str(runtime_dir).casefold()
+    entries: list[tuple[str, str]] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if line.casefold().startswith(expected_path):
+            line = line[len(str(runtime_dir)) :].strip()
+        if ":" not in line or "(" not in line:
+            continue
+        principal, permissions = line.rsplit(":", 1)
+        principal = principal.strip().casefold()
+        if principal:
+            entries.append((principal, permissions.upper()))
+
+    if not entries or any(
+        principal not in allowed or "(I)" in permissions or "(DENY)" in permissions
+        for principal, permissions in entries
+    ):
+        raise RuntimeStateError("runtime_dir_permissions_too_open")
+
+    full_control = {principal for principal, permissions in entries if "(F)" in permissions}
+    current_user_has_access = bool(full_control.intersection({username.casefold(), user_sid.casefold()}))
+    if not current_user_has_access or not any(
+        principal in {"nt authority\\system", "s-1-5-18"} for principal in full_control
+    ):
+        raise RuntimeStateError("runtime_dir_permissions_too_open")
 
 
 def effective_notification_mode(config, now=None):

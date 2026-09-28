@@ -10,6 +10,7 @@ from codex_away_mode.cards import (
     command_feedback_text,
     completion_card,
     fallback_completion_card,
+    live_completion_card,
     ordinary_dm_hint_text,
     pre_timeout_reminder_card,
     timeout_card,
@@ -476,3 +477,42 @@ def test_retired_card_reply_text_points_to_latest_card():
     assert "旧卡" in text
     assert "最新" in text
     assert "回复" in text
+
+
+def test_live_completion_card_keeps_visible_commentary_and_formats_commands():
+    commentary = "进度说明：" + ("细节" * 2500)
+    card = live_completion_card(
+        status="working",
+        activities=[
+            {"kind": "commentary", "text": commentary},
+            {"kind": "command", "text": "已运行命令：\npython -m compileall"},
+        ],
+        started_at="2026-06-18T10:00:00Z",
+        now="2026-06-18T10:01:00Z",
+    )
+
+    panel = card["body"]["elements"][0]
+    rendered = flatten_text(panel)
+    assert panel["tag"] == "collapsible_panel"
+    assert panel["header"]["title"]["content"] == "思考过程（2）"
+    assert panel["border"]["color"] == "grey-300"
+    assert commentary in rendered
+    assert "已运行命令" in rendered
+    assert "python -m compileall" in rendered
+
+
+def test_live_completion_card_keeps_full_timeline_and_green_final_answer():
+    activities = [{"kind": "commentary", "text": f"步骤 {index}"} for index in range(58)]
+    answer = "最终答复：" + "详细内容" * 4000
+    card = live_completion_card(
+        status="completed",
+        activities=activities,
+        started_at="2026-06-18T10:00:00Z",
+        now="2026-06-18T10:05:18Z",
+        answer=answer,
+    )
+    panel = card["body"]["elements"][0]
+    assert card["header"]["template"] == "green"
+    assert panel["header"]["title"]["content"] == "思考过程（58）"
+    assert len(panel["elements"]) == 58
+    assert answer in flatten_text(card)

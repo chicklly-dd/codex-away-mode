@@ -40,6 +40,87 @@ def completion_card(
     )
 
 
+def live_completion_card(
+    *,
+    status: str,
+    activities: list[Any],
+    activity_count: int | None = None,
+    started_at: datetime | str,
+    now: datetime | str,
+    cwd: str | None = None,
+    answer: str | None = None,
+) -> dict[str, Any]:
+    """Build a single card that is refreshed as the Codex turn progresses."""
+    done = status == "completed"
+    elements: list[dict[str, Any]] = []
+    if activities:
+        visible = activities
+        count = max(len(activities), int(activity_count or 0))
+        activity_elements: list[dict[str, Any]] = []
+        for item in visible:
+            if isinstance(item, dict):
+                kind = item.get("kind")
+                content = str(item.get("text") or "").strip()
+                if not content:
+                    continue
+                if kind == "commentary":
+                    # This is user-visible assistant commentary, not private reasoning.
+                    activity_elements.append(_markdown(content))
+                elif kind == "command":
+                    activity_elements.append(_markdown(_command_activity(content)))
+                else:
+                    activity_elements.append(_markdown(f"- {content}"))
+            else:
+                activity_elements.append(_markdown(f"- {str(item)}"))
+        elements.append(
+            {
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "border": {"color": "grey-300", "corner_radius": "6px"},
+                "header": {
+                    "background_color": "grey-200",
+                    "icon": {"tag": "standard_icon", "token": "right_outlined", "color": "grey"},
+                    "icon_position": "right",
+                    "icon_expanded_angle": 90,
+                    "title": {
+                        "tag": "plain_text",
+                        "content": f"思考过程（{count}）",
+                    }
+                },
+                "elements": activity_elements,
+            }
+        )
+        if answer:
+            elements.append({"tag": "hr"})
+    if answer:
+        elements.append(_markdown(str(answer).strip()))
+    elif done:
+        elements.append(_markdown("本轮已结束。"))
+    else:
+        elements.append(_markdown("已收到任务，正在处理中。"))
+
+    elapsed = _elapsed_seconds(started_at, now)
+    elements.append(
+        {
+            "tag": "markdown",
+            "content": f"⏱ 用时 {_format_duration(elapsed)}",
+            "text_size": "notation",
+        }
+    )
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": "已完成" if done else "正在处理",
+            },
+            "template": "green" if done else "blue",
+        },
+        "body": {"elements": elements},
+    }
+
+
 def fallback_completion_card(
     *,
     reason: str,
@@ -603,3 +684,40 @@ def _display_datetime(value: datetime | str) -> str:
     except ValueError:
         return str(value)
     return _display_datetime(parsed)
+
+
+def _elapsed_seconds(started_at: datetime | str, now: datetime | str) -> int:
+    def parse(value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value.astimezone()
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
+
+    try:
+        return max(0, int((parse(now) - parse(started_at)).total_seconds()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {remainder} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes} 分"
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = "\n\n（内容较长，卡片中已截断；完整答复见 Codex。）"
+    budget = max(0, max_bytes - len(suffix.encode("utf-8")))
+    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
+
+
+def _command_activity(content: str) -> str:
+    command = content.removeprefix("已运行命令：\n")
+    fence = "`" * max(3, max((len(match.group(0)) for match in re.finditer(r"`+", command)), default=0) + 1)
+    return f"- 已运行命令：\n{fence}text\n{command}\n{fence}"

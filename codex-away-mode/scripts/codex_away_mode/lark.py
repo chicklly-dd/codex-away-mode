@@ -57,6 +57,21 @@ class LarkCli:
         args = self._send_args(user_id=user_id, chat_id=chat_id, msg_type="interactive", content=card)
         return self._map_send_result(self._run_json(args))
 
+    def update_interactive_card(self, *, message_id: str, card: dict[str, Any]) -> dict[str, Any]:
+        payload = json.dumps({"content": json.dumps(card, ensure_ascii=False)}, ensure_ascii=False)
+        return self._run_json(
+            [
+                "api",
+                "PATCH",
+                f"/open-apis/im/v1/messages/{message_id}",
+                "--as",
+                "bot",
+                "--data",
+                payload,
+                "--json",
+            ]
+        )
+
     def send_text(
         self,
         *,
@@ -181,7 +196,7 @@ class LarkCli:
         return {"ok": True}
 
     def app_config_status(self) -> dict[str, Any]:
-        config_command = [self.binary, "config", "init", "--new"]
+        config_command = self._command(["config", "init", "--new"])
         try:
             data = self._run_json_allow_error(["config", "show"])
         except LarkCliError as exc:
@@ -357,8 +372,9 @@ class LarkCli:
         return raw
 
     def _run_subprocess(self, args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+        command = self._command(args)
         return subprocess.run(
-            [self.binary, *args],
+            command,
             check=False,
             capture_output=True,
             text=True,
@@ -382,27 +398,27 @@ class LarkCli:
                 text,
                 opener=opener,
                 process_id=None,
-                debug_command=[self.binary, *args],
+                debug_command=self._command(args),
             )
         except subprocess.CalledProcessError as exc:
             detail = exc.stderr or exc.stdout or str(exc)
-            return self._app_config_init_failed(detail, debug_command=[self.binary, *args])
+            return self._app_config_init_failed(detail, debug_command=self._command(args))
         except OSError as exc:
-            return self._app_config_init_failed(str(exc), debug_command=[self.binary, *args])
+            return self._app_config_init_failed(str(exc), debug_command=self._command(args))
 
         if isinstance(raw, subprocess.CompletedProcess):
             text = self._output_text(raw.stdout) + "\n" + self._output_text(raw.stderr)
             url = self._extract_url(text)
             browser_opened = self._try_open_url(url, opener) if url else False
             if raw.returncode != 0:
-                return self._app_config_init_failed(text, debug_command=[self.binary, *args])
+                return self._app_config_init_failed(text, debug_command=self._command(args))
             status = self.app_config_status()
             if status.get("ok"):
                 status.update(
                     {
                         "verification_url": url,
                         "browser_opened": browser_opened,
-                        "debug_command": [self.binary, *args],
+                        "debug_command": self._command(args),
                     }
                 )
                 return status
@@ -410,14 +426,14 @@ class LarkCli:
                 text,
                 opener=opener,
                 process_id=None,
-                debug_command=[self.binary, *args],
+                debug_command=self._command(args),
             )
         text = self._output_text(raw)
         return self._pending_app_config_result(
             text,
             opener=opener,
             process_id=None,
-            debug_command=[self.binary, *args],
+            debug_command=self._command(args),
         )
 
     def _start_app_config_init_background(
@@ -427,7 +443,7 @@ class LarkCli:
         opener: Callable[[str], bool],
         wait_seconds: int,
     ) -> dict[str, Any]:
-        debug_command = [self.binary, *args]
+        debug_command = self._command(args)
         fd, log_path = tempfile.mkstemp(prefix="codex-away-lark-config-", suffix=".log")
         log_file = os.fdopen(fd, "wb", buffering=0)
         process: subprocess.Popen[bytes] | None = None
@@ -599,6 +615,14 @@ class LarkCli:
             return True
         except OSError:
             return False
+
+    def _command(self, args: list[str]) -> list[str]:
+        if os.name == "nt" and self.binary.lower().endswith(".js"):
+            node = shutil.which("node.exe") or shutil.which("node")
+            if not node:
+                raise FileNotFoundError("Node.js is required to run the configured lark-cli script")
+            return [node, self.binary, *args]
+        return [self.binary, *args]
 
     def _extract_url(self, text: str) -> str | None:
         text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
