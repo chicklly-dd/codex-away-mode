@@ -74,7 +74,7 @@ The recommended installation flow is to give this repository link to Codex and a
 If you use the `skills` CLI, you can install the Skill into Codex first:
 
 ```bash
-npx skills add sudoHG/codex-away-mode --skill codex-away-mode -a codex -g
+npx skills add chicklly-dd/codex-away-mode --skill codex-away-mode -a codex -g
 ```
 
 This only installs the Skill. Feishu authorization, Codex Hook trust, and end-to-end notification verification should still be completed by Codex through the flow below.

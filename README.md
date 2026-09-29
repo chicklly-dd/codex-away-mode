@@ -80,7 +80,7 @@ Codex Away Mode 的核心区别是：**它以 Codex 桌面端应用为主工作�
 如果你使用 `skills` CLI，也可以先把 Skill 安装到 Codex：
 
 ```bash
-npx skills add sudoHG/codex-away-mode --skill codex-away-mode -a codex -g
+npx skills add chicklly-dd/codex-away-mode --skill codex-away-mode -a codex -g
 ```
 
 这一步只负责安装 Skill。飞书授权、Codex Hook（钩子）信任和端到端通知验证，仍建议让 Codex 按下面的安装流程继续完成。
