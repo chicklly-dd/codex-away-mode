@@ -108,6 +108,32 @@ def test_install_hooks_preserves_existing_groups_and_backs_up(tmp_path):
     assert list(backup_dir.glob("hooks.json.*.bak"))
 
 
+def test_install_hooks_accepts_utf8_bom(tmp_path):
+    hooks_path = tmp_path / "hooks.json"
+    backup_dir = tmp_path / "backups"
+    payload = json.dumps(
+        {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other stop"}]}]}}
+    ).encode("utf-8")
+    hooks_path.write_bytes(b"\xef\xbb\xbf" + payload)
+
+    hooks.install_hooks(
+        hooks_path=hooks_path,
+        backup_dir=backup_dir,
+        cli_command="/bin/codex-away-mode",
+    )
+
+    installed = json.loads(hooks_path.read_text(encoding="utf-8"))
+    stop_commands = [
+        hook["command"]
+        for group in installed["hooks"]["Stop"]
+        for hook in group["hooks"]
+    ]
+    assert stop_commands == [
+        "other stop",
+        "/bin/codex-away-mode notify stop --json",
+    ]
+
+
 def test_install_hooks_is_idempotent(tmp_path):
     hooks_path = tmp_path / "hooks.json"
     backup_dir = tmp_path / "backups"

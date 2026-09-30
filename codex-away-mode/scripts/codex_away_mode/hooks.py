@@ -166,7 +166,10 @@ def _remove_managed_entries(hooks_root: dict[str, Any], event: str) -> None:
 def _read_hooks(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"hooks": {}}
-    return json.loads(path.read_text(encoding="utf-8"))
+    # Windows PowerShell 5 writes JSON with a UTF-8 BOM by default. Accept
+    # both BOM and BOM-less files so other Windows hook installers can safely
+    # compose their entries with Codex Away Mode.
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def _write_hooks(path: Path, data: dict[str, Any]) -> None:
